@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -39,8 +40,8 @@ import (
 
 // Waiter is an interface for waiting for criteria in Kubernetes to happen
 type Waiter interface {
-	// WaitForControlPlaneComponents waits for all control plane components to report "ok" on /healthz
-	WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration) error
+	// WaitForControlPlaneComponents waits for all control plane components to be ready.
+	WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration, apiServerAddress string) error
 	// WaitForAPI waits for the API Server's /healthz endpoint to become "ok"
 	// TODO: remove WaitForAPI once WaitForAllControlPlaneComponents goes GA:
 	// https://github.com/kubernetes/kubeadm/issues/2907
@@ -81,36 +82,75 @@ type controlPlaneComponent struct {
 	url  string
 }
 
+const (
+	// TODO: switch to /livez once all components support it
+	// and delete the endpointHealthz constant.
+	// https://github.com/kubernetes/kubernetes/issues/118158
+	endpointHealthz = "healthz"
+	endpointLivez   = "livez"
+)
+
 // getControlPlaneComponents takes a ClusterConfiguration and returns a slice of
-// control plane components and their secure ports.
-func getControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration) []controlPlaneComponent {
-	portArg := "secure-port"
+// control plane components and their health check URLs.
+func getControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration, defaultAddressAPIServer string) []controlPlaneComponent {
+	const (
+		portArg        = "secure-port"
+		bindAddressArg = "bind-address"
+		// By default, for kube-api-server, kubeadm does not apply a --bind-address flag.
+		// Check --advertise-address instead, which can override the defaultAddressAPIServer value.
+		advertiseAddressArg = "advertise-address"
+		// By default kubeadm deploys the kube-controller-manager and kube-scheduler
+		// with --bind-address=127.0.0.1. This should match get{Scheduler|ControllerManager}Command().
+		defaultAddressKCM       = "127.0.0.1"
+		defaultAddressScheduler = "127.0.0.1"
+	)
+
 	portAPIServer, idx := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, portArg, -1)
 	if idx == -1 {
-		portAPIServer = "6443"
+		portAPIServer = fmt.Sprintf("%d", constants.KubeAPIServerPort)
 	}
 	portKCM, idx := kubeadmapi.GetArgValue(cfg.ControllerManager.ExtraArgs, portArg, -1)
 	if idx == -1 {
-		portKCM = "10257"
+		portKCM = fmt.Sprintf("%d", constants.KubeControllerManagerPort)
 	}
 	portScheduler, idx := kubeadmapi.GetArgValue(cfg.Scheduler.ExtraArgs, portArg, -1)
 	if idx == -1 {
-		portScheduler = "10259"
+		portScheduler = fmt.Sprintf("%d", constants.KubeSchedulerPort)
 	}
-	urlFormat := "https://127.0.0.1:%s/healthz"
+
+	addressAPIServer, idx := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, advertiseAddressArg, -1)
+	if idx == -1 {
+		addressAPIServer = defaultAddressAPIServer
+	}
+	addressKCM, idx := kubeadmapi.GetArgValue(cfg.ControllerManager.ExtraArgs, bindAddressArg, -1)
+	if idx == -1 {
+		addressKCM = defaultAddressKCM
+	}
+	addressScheduler, idx := kubeadmapi.GetArgValue(cfg.Scheduler.ExtraArgs, bindAddressArg, -1)
+	if idx == -1 {
+		addressScheduler = defaultAddressScheduler
+	}
+
+	getURL := func(address, port, endpoint string) string {
+		return fmt.Sprintf(
+			"https://%s/%s",
+			net.JoinHostPort(address, port),
+			endpoint,
+		)
+	}
 	return []controlPlaneComponent{
-		{name: "kube-apiserver", url: fmt.Sprintf(urlFormat, portAPIServer)},
-		{name: "kube-controller-manager", url: fmt.Sprintf(urlFormat, portKCM)},
-		{name: "kube-scheduler", url: fmt.Sprintf(urlFormat, portScheduler)},
+		{name: "kube-apiserver", url: getURL(addressAPIServer, portAPIServer, endpointLivez)},
+		{name: "kube-controller-manager", url: getURL(addressKCM, portKCM, endpointHealthz)},
+		{name: "kube-scheduler", url: getURL(addressScheduler, portScheduler, endpointLivez)},
 	}
 }
 
-// WaitForControlPlaneComponents waits for all control plane components to report "ok" on /healthz
-func (w *KubeWaiter) WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration) error {
+// WaitForControlPlaneComponents waits for all control plane components to report "ok".
+func (w *KubeWaiter) WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfiguration, apiSeverAddress string) error {
 	fmt.Printf("[control-plane-check] Waiting for healthy control plane components."+
 		" This can take up to %v\n", w.timeout)
 
-	components := getControlPlaneComponents(cfg)
+	components := getControlPlaneComponents(cfg, apiSeverAddress)
 
 	var errs []error
 	errChan := make(chan error, len(components))
@@ -133,7 +173,7 @@ func (w *KubeWaiter) WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfig
 				true, func(ctx context.Context) (bool, error) {
 					resp, err := client.Get(comp.url)
 					if err != nil {
-						lastError = errors.WithMessagef(err, "%s /healthz check failed", comp.name)
+						lastError = errors.WithMessagef(err, "%s check failed at %s", comp.name, comp.url)
 						return false, nil
 					}
 
@@ -141,7 +181,8 @@ func (w *KubeWaiter) WaitForControlPlaneComponents(cfg *kubeadmapi.ClusterConfig
 						_ = resp.Body.Close()
 					}()
 					if resp.StatusCode != http.StatusOK {
-						lastError = errors.Errorf("%s /healthz check failed with status: %d", comp.name, resp.StatusCode)
+						lastError = errors.Errorf("%s check failed at %s with status: %d",
+							comp.name, comp.url, resp.StatusCode)
 						return false, nil
 					}
 
